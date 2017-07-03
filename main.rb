@@ -68,6 +68,8 @@ Anime name: #{@current_song["anime_name"]}
     voice_chan = @bot.channel(ENV["CHANNEL_ID"])
     voice = @bot.voice_connect(voice_chan)
     voice.adjust_average = true
+    voice.adjust_offset = (ENV["ADJUST_OFFSET"] || 5).to_i
+    voice.adjust_interval = (ENV["ADJUST_INTERVAL"] || 50).to_i
     voice.volume = @volume
     voice.play_file(ENV["STREAM_URL"] || "http://listen.moe:9999/stream")
 
