@@ -3,17 +3,19 @@ require 'yaml'
 require 'faye/websocket'
 require 'eventmachine'
 require 'json'
+require 'yaml'
 
 # apt-get install libopus-dev libsodium-dev ffmpeg
 
 @bot = nil
 @ws = nil
-@thread = nil
+@threads = []
 @admins = {
   "122908555178147840" => true
 }
 @volume = 0.5
 @current_song = {}
+
 running = true
 client_id = ENV["CLIENT_ID"]
 default_ws_url = 'wss://listen.moe/api/v2/socket'
@@ -22,70 +24,96 @@ default_ws_url = 'wss://listen.moe/api/v2/socket'
 @add_url = "https://discordapp.com/api/oauth2/authorize?client_id=#{client_id}&scope=bot&permissions=0"
 
 
+@log_queue = []
+@log_channel = ENV["BOT_LOG_CHANNEL"] || "331596661954576385"
+
+def log(message, type=:debug)
+  @log_queue.push({time: Time.now.to_i, message: message})
+  loop do
+    curr_log = @log_queue.last
+    begin
+      @bot.channel(@log_channel).send_message("[YUI][#{type.to_s.upcase}][#{Time.at(curr_log[:time])}] #{curr_log[:message]}") if curr_log
+      @log_queue.pop
+    rescue
+      break
+    end
+    break if @log_queue.length == 0
+  end
+end
+
+stdout = StringIO.new
+Discordrb::LOGGER.streams << stdout
+
+Thread.new do
+  loop do
+    log(stdout.readline, :dsout)
+    break if !running
+  end
+end
+
 Signal.trap("INT") do
-  puts "Stopping..."
+  log "Stopping..."
   EventMachine::stop_event_loop
   if !running
-    puts "Force stopping..."
+    log "Force stopping..."
     exit(1)
   end
   running = false
 end
 
 def start_bot!(client_id)
-  @thread = Thread.new do
 
-    @bot = Discordrb::Bot.new token: ENV["BOT_TOKEN"], client_id: client_id
+  @bot = Discordrb::Bot.new token: ENV["BOT_TOKEN"], client_id: client_id
 
-    @bot.message(start_with: "yui hi") do |event|
-      event.respond("Hello~!")
+  @bot.message(start_with: "yui hi") do |event|
+    event.respond("Hello~!")
+  end
+
+  @bot.message(start_with: "yui volume") do |event|
+    if @admins.has_key?("#{event.user.id}")
+      tokens = event.message.content.split(" ")
+      @volume = tokens[2].to_f
+      event.respond("Okie~! Be right baack")
+      stop_bot!
     end
+  end
 
-    @bot.message(start_with: "yui volume") do |event|
-      if @admins.has_key?("#{event.user.id}")
-        tokens = event.message.content.split(" ")
-        @volume = tokens[2].to_f
-        event.respond("Okie~! Be right baack")
-        stop_bot!
-      end
-    end
+  @bot.message(start_with: "yui np") do |event|
 
-    @bot.message(start_with: "yui np") do |event|
-
-      tstamp = Time.at(Time.now.to_i - @current_song["start_time"]).strftime("%M:%S")
-      event.respond(<<-RESPONSE
+    tstamp = Time.at(Time.now.to_i - @current_song["start_time"]).strftime("%M:%S")
+    event.respond(<<-RESPONSE
 **Now playing**
 #{tstamp}
 Song name: #{@current_song["song_name"]}
 Artist name: #{@current_song["artist_name"]}
 Anime name: #{@current_song["anime_name"]}
-      RESPONSE
-      )
+    RESPONSE
+    )
+  end
+
+  @bot.run :async
+
+  @threads = []
+
+  ENV["CHANNEL_ID"].split(",").each do |chan_id|
+    @threads << Thread.new do
+      voice_chan = @bot.channel(chan_id)
+      voice = @bot.voice_connect(voice_chan)
+      voice.adjust_average = false
+      voice.adjust_offset = (ENV["ADJUST_OFFSET"] || 5).to_i
+      voice.adjust_interval = (ENV["ADJUST_INTERVAL"] || 50).to_i
+      voice.volume = @volume
+      log "Joined #{chan_id}"
+      voice.play_file(ENV["STREAM_URL"] || "http://listen.moe:9999/stream")
+      log "Exited #{chan_id}"
     end
-
-    @bot.run :async
-
-    voice_chan = @bot.channel(ENV["CHANNEL_ID"])
-    voice = @bot.voice_connect(voice_chan)
-    voice.adjust_average = true
-    voice.adjust_offset = (ENV["ADJUST_OFFSET"] || 5).to_i
-    voice.adjust_interval = (ENV["ADJUST_INTERVAL"] || 50).to_i
-    voice.volume = @volume
-    voice.play_file(ENV["STREAM_URL"] || "http://listen.moe:9999/stream")
-
-    @bot.stop
-    @bot = nil
   end
 
-  loop do
-    sleep(1)
-    break if @bot
-  end
 end
 
 def stop_bot!
   @bot.stop
-  @thread.join
+  @thread.each {|x| x.join}
 end
 
 def ensure_bot!(client_id)
@@ -96,7 +124,7 @@ def ensure_bot!(client_id)
     @bot.dnd
     @bot.online
   rescue => e
-    puts e
+    log e, :error
     connected = false
   end
 
@@ -104,8 +132,9 @@ def ensure_bot!(client_id)
     begin
       @bot.stop
     rescue => e
+      log e, :error
     end
-    puts "Bot not running. Starting up."
+    log "Bot not running. Starting up."
     start_bot!(client_id)
   end
 
@@ -113,22 +142,29 @@ def ensure_bot!(client_id)
     @ws = Faye::WebSocket::Client.new(@ws_url)
 
     @ws.on :open do |event|
-      puts "Opened websocket to #{@ws_url}"
+      log "Opened websocket to #{@ws_url}"
     end
 
     @ws.on :message do |event|
-      puts "Received websocket message"
-      p event.data
+      data = nil
       begin
-        @current_song = JSON.parse(event.data)
-        @current_song["start_time"] = Time.now.to_i
-        @bot.game = "#{@current_song["song_name"]} by #{@current_song["artist_name"]}"
-      rescue
+        data = JSON.parse(event.data)
+      rescue => e
+      end
+      if (data)
+        log "Received websocket message: \n```\n#{data.to_yaml}\n```"
+        begin
+          @current_song = JSON.parse(event.data)
+          @current_song["start_time"] = Time.now.to_i
+          @bot.game = "#{@current_song["song_name"]} by #{@current_song["artist_name"]}"
+        rescue => e
+          log e, :error
+        end
       end
     end
 
     @ws.on :close do |event|
-      puts "Closed websocket"
+      log "Closed websocket", :error
       @ws = nil
     end
   end
