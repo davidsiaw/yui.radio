@@ -140,8 +140,13 @@ def ensure_bot!(client_id)
   connected = true
   begin
     connected = @bot.connected?
-    @bot.dnd
-    @bot.online
+    ENV["CHANNEL_ID"].split(",").each do |chan_id|
+      voice_chan = @bot.channel(chan_id)
+      if voice_chan.users.select {|x| x.id == @bot.profile.id}.length == 0
+        log "I have dropped out of channel #{chan_id}. Restarting.", :debug
+        connected = false
+      end
+    end
   rescue => e
     log e, :error
     connected = false
@@ -149,7 +154,7 @@ def ensure_bot!(client_id)
 
   if !connected
     begin
-      @bot.stop
+      stop_bot!
     rescue => e
       log "#{e.to_s.gsub("`", "'")}\n```\n#{e.backtrace.join("\n")}\n```", :error
     end
@@ -188,6 +193,8 @@ def ensure_bot!(client_id)
     end
   end
 end
+
+p @add_url
 
 loop do
   EM.run {
